@@ -3,6 +3,10 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext
 import threading, json, os, sys, subprocess, time as _time, collections, datetime, urllib.request, urllib.parse, tempfile, shutil, webbrowser
 
+# 抑制 SSL 警告（使用本地代理时）
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # ── Debug ──
 DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herrs_debug.log")
 def debug(msg):
@@ -12,6 +16,30 @@ def debug(msg):
     except: pass
 
 debug("=== Herrs v5 启动 ===")
+
+# ── 代理配置 ──
+def get_proxy_config():
+    """检测代理配置，优先从配置文件读取，其次读环境变量"""
+    # 从配置文件读
+    lc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herrs_config.json")
+    try:
+        if os.path.exists(lc):
+            cfg = json.load(open(lc))
+            if cfg.get("proxy"):
+                proxy_url = cfg["proxy"]
+                debug(f"使用配置代理: {proxy_url}")
+                return {"http": proxy_url, "https": proxy_url}
+    except: pass
+    # 从环境变量
+    for env_var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]:
+        val = os.environ.get(env_var)
+        if val:
+            debug(f"使用环境变量代理 ({env_var}): {val}")
+            return {"http": val, "https": val}
+    debug("未检测到代理配置")
+    return None
+
+_proxy = get_proxy_config()
 
 HERMES_HOME = os.path.expandvars(r"%LOCALAPPDATA%\hermes")
 SKILLS_DIR = os.path.join(HERMES_HOME, "skills")
@@ -197,6 +225,25 @@ def execute_tool(name, args):
     except Exception as e:
         return f"工具错误: {e}"
 
+def _check_permission_issue(tool_name, args, result):
+    """检测工具执行结果中的权限问题，返回提示信息"""
+    result_lower = result.lower()
+    # 文件写入权限
+    if tool_name == "write_file":
+        if "permission" in result_lower or "access denied" in result_lower or "拒绝访问" in result:
+            return f"文件写入被拒绝: {args.get('path','?')}\n    → 请以管理员身份运行，或将文件保存到桌面/文档文件夹"
+    # 命令执行权限
+    if tool_name == "run_command":
+        if "access denied" in result_lower or "requires elevation" in result_lower or "拒绝访问" in result:
+            return "该命令需要管理员权限\n    → 请右键→以管理员身份运行 Herrs"
+    if tool_name == "kill_process":
+        if "access denied" in result_lower or "拒绝访问" in result:
+            return "结束该进程需要管理员权限\n    → 请右键→以管理员身份运行 Herrs"
+    if tool_name == "screenshot":
+        if "access" in result_lower and "denied" in result_lower:
+            return "截屏权限不足\n    → 检查Windows隐私设置→屏幕截图权限"
+    return None
+
 # ═══════════════════════════════════════════
 # DeepSeek API（工具模式 = function calling）
 # ═══════════════════════════════════════════
@@ -209,27 +256,86 @@ def call_deepseek_with_tools(messages, api_key, progress_cb=None):
         "优先使用工具直接完成任务，不要只给文字建议。用中文回复，简洁高效。"
     )}
     full = [system] + list(messages[-10:])
-    for _ in range(15):
+    
+    # 请求配置（代理 + SSL）
+    req_kwargs = {"timeout": (10, 120)}  # (连接超时, 读取超时)
+    if _proxy:
+        req_kwargs["proxies"] = _proxy
+        if "127.0.0.1" in str(_proxy) or "localhost" in str(_proxy):
+            req_kwargs["verify"] = False  # 本地代理可能不验证SSL
+    
+    for loop in range(15):
         try:
+            if progress_cb: progress_cb("📡 调用 DeepSeek API...", phase="api")
+            debug(f"API请求 #{loop+1}: messages={len(full)}, proxy={bool(_proxy)}")
+            
             resp = requests.post("https://api.deepseek.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": "deepseek-chat", "messages": full, "tools": TOOLS, "max_tokens": 4096}, timeout=120)
-            if resp.status_code != 200: return f"API 错误 [{resp.status_code}]: {resp.text[:200]}"
+                json={"model": "deepseek-chat", "messages": full, "tools": TOOLS, "max_tokens": 4096},
+                **req_kwargs)
+            
+            if resp.status_code != 200:
+                err_detail = resp.text[:300]
+                debug(f"API错误 [{resp.status_code}]: {err_detail}")
+                if resp.status_code in (401, 403):
+                    return f"🔑 API Key 无效或过期 [{resp.status_code}]"
+                elif resp.status_code == 429:
+                    import time as _t
+                    if progress_cb: progress_cb(f"⏳ API限流 [{resp.status_code}]，等3秒重试...", phase="wait")
+                    _t.sleep(3)
+                    continue
+                return f"🌐 API 错误 [{resp.status_code}]: {err_detail}"
+            
+            if progress_cb: progress_cb("🧠 模型思考中...", phase="model")
             data = resp.json()
             msg = data["choices"][0]["message"]
+            
             if msg.get("tool_calls"):
+                if progress_cb: progress_cb(f"🔧 模型决定调用 {len(msg['tool_calls'])} 个工具", phase="decide")
                 full.append(msg)
-                for tc in msg["tool_calls"]:
+                for i, tc in enumerate(msg["tool_calls"]):
                     tn = tc["function"]["name"]
-                    ta = json.loads(tc["function"]["arguments"])
-                    if progress_cb: progress_cb(f"🔧 {tn}...")
+                    try:
+                        ta = json.loads(tc["function"]["arguments"])
+                    except:
+                        ta = {}
+                    if progress_cb: progress_cb(f"🔧 执行工具 ({i+1}/{len(msg['tool_calls'])}): {tn}", phase="tool")
                     result = execute_tool(tn, ta)
+                    # 检测权限问题
+                    perm_issue = _check_permission_issue(tn, ta, result)
+                    if perm_issue and progress_cb:
+                        progress_cb(f"⚠️ 权限提示: {perm_issue}", phase="perm")
                     full.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                if progress_cb: progress_cb("📊 工具结果已返回，等待模型处理...", phase="done")
                 continue
+            
+            if progress_cb: progress_cb("✍️ 生成回复中...", phase="done")
             return msg.get("content", "")
+            
+        except requests.exceptions.ProxyError as e:
+            debug(f"代理错误: {e}")
+            return f"🔌 代理连接失败 ({_proxy.get('http','?')}): 请检查代理是否在运行，或在配置中移除代理"
+        except requests.exceptions.SSLError as e:
+            debug(f"SSL错误: {e}")
+            # SSL失败时关闭验证重试一次
+            if req_kwargs.get("verify") is not False:
+                req_kwargs["verify"] = False
+                debug("关闭SSL验证重试...")
+                continue
+            return f"🔒 SSL证书验证失败: {e}"
+        except requests.exceptions.ConnectionError as e:
+            debug(f"连接错误: {e}")
+            if "getaddrinfo failed" in str(e) or "Name or service not known" in str(e):
+                return f"🌐 DNS解析失败: 检查网络连接"
+            return f"🔌 网络连接失败: 请检查网络/代理\n  ({str(e)[:150]})"
+        except requests.exceptions.Timeout as e:
+            debug(f"超时: {e}")
+            return f"⏰ 请求超时 (120s): 可能网络较慢或模型负载高，请重试"
         except Exception as e:
-            return f"连接失败: {e}"
-    return "达到最大工具调用轮数"
+            debug(f"未知错误: {e}")
+            return f"❌ 连接异常: {e}"
+    
+    return "⏰ 达到最大工具调用轮数(15轮)"
 
 # ═══════════════════════════════════════════
 # Skills 加载
@@ -415,7 +521,12 @@ class HerrsApp:
         self.btn_simple.bind("<Leave>", lambda e: self._on_hover(e, self.btn_simple, False))
 
         # 右上角 API 按钮
-        self.key_btn = tk.Label(topbar, text="🔑 已配置" if self.api_key else "⚠️ 设置API",
+        key_text = "🔑 已配置"
+        if _proxy:
+            key_text += " · 代理"
+        elif not self.api_key:
+            key_text = "⚠️ 设置API"
+        self.key_btn = tk.Label(topbar, text=key_text,
                                 fg=c["warn"] if self.api_key else c["danger"],
                                 bg=c["bg_card"], font=("Segoe UI", 9, "bold"),
                                 cursor="hand2", padx=14)
@@ -708,10 +819,16 @@ class HerrsApp:
             if eng == "tools" and self.api_key:
                 result = call_deepseek_with_tools(
                     self.messages[-6:], self.api_key,
-                    progress_cb=lambda l: self.root.after(0, lambda: self._update_progress(l)))
+                    progress_cb=lambda l, phase="": self.root.after(0, lambda: self._update_progress(l, phase)))
             elif self.api_key:
                 import requests
                 try:
+                    self._update_progress("📡 调用 DeepSeek API...", "api")
+                    req_kw = {"timeout": (10, 120)}
+                    if _proxy:
+                        req_kw["proxies"] = _proxy
+                        if "127.0.0.1" in str(_proxy) or "localhost" in str(_proxy):
+                            req_kw["verify"] = False
                     r = requests.post("https://api.deepseek.com/v1/chat/completions",
                         headers={"Authorization": f"Bearer {self.api_key}",
                                  "Content-Type": "application/json"},
@@ -719,9 +836,20 @@ class HerrsApp:
                               "messages": [{"role": "system",
                                             "content": "你是 Herrs，AI桌面助手。纯聊天模式，不用工具。简洁回答，中文。"}]
                                           + self.messages[-6:],
-                              "max_tokens": 4096}, timeout=120)
-                    result = r.json()["choices"][0]["message"]["content"] if r.status_code == 200 \
-                        else f"API 错误 [{r.status_code}]"
+                              "max_tokens": 4096}, **req_kw)
+                    if r.status_code == 200:
+                        self._update_progress("🧠 模型思考中...", "model")
+                        result = r.json()["choices"][0]["message"]["content"]
+                    elif r.status_code in (401, 403):
+                        result = f"🔑 API Key 无效 [{r.status_code}]"
+                    elif r.status_code == 429:
+                        result = f"⏳ API限流 [{r.status_code}]，请稍后重试"
+                    else:
+                        result = f"🌐 API 错误 [{r.status_code}]: {r.text[:200]}"
+                except requests.exceptions.ConnectionError as e:
+                    result = f"🔌 网络连接失败: 检查网络或代理设置\n  ({str(e)[:120]})"
+                except requests.exceptions.ProxyError:
+                    result = f"🔌 代理连接失败: 检查代理 ({_proxy.get('http','?') if _proxy else '无'})"
                 except Exception as e:
                     result = f"❌ {e}"
             else:
@@ -742,9 +870,16 @@ class HerrsApp:
         self._think_dots += 1
         self._think_timer = self.root.after(250, self._animate_thinking)
 
-    def _update_progress(self, line):
+    def _update_progress(self, line, phase=""):
+        """更新状态栏 — 显示详细进度阶段"""
         if line:
-            self.status_lbl.configure(text=f"  🛠️ 执行工具: {line[:55]}")
+            self.status_lbl.configure(
+                text=f"  {line[:65]}",
+                fg=self.c["accent2"] if phase == "perm" else self.c["fg_dim"])
+            
+            # 权限问题——闪烁提示并在聊天区显示
+            if phase == "perm":
+                self._add_message("⚡ 权限提示", line, "system")
 
     def _on_response(self, text):
         self._thinking_active = False
@@ -759,7 +894,8 @@ class HerrsApp:
 
         total = sum(len(v) for v in self.skill_groups.values())
         self.status_lbl.configure(
-            text=f"  🟢 就绪  |  Skills: {total}  |  Ctrl+Enter 发送")
+            text=f"  🟢 就绪  |  Skills: {total}  |  Ctrl+Enter 发送",
+            fg=self.c["fg_dim"])
 
     # ═══════════════════════════════════════════
     # API Key 弹窗
@@ -767,24 +903,43 @@ class HerrsApp:
     def _show_api_dialog(self):
         c = self.c
         d = tk.Toplevel(self.root)
-        d.title("API Key"); d.geometry("520x240")
+        d.title("API & 代理设置"); d.geometry("540x360")
         d.configure(bg=c["bg_card"]); d.resizable(False, False)
         d.transient(self.root); d.grab_set()
 
         tk.Label(d, text="🔑 DeepSeek API Key", fg=c["accent2"], bg=c["bg_card"],
-                 font=("Segoe UI", 14, "bold")).pack(pady=(24, 6))
+                 font=("Segoe UI", 14, "bold")).pack(pady=(20, 6))
         tk.Label(d, text="platform.deepseek.com → API Keys", fg=c["fg_dim"],
                  bg=c["bg_card"], font=("Segoe UI", 9)).pack()
 
         e = tk.Entry(d, font=("Segoe UI", 11), bg=c["bg_input"], fg=c["fg"],
-                     insertbackground=c["accent2"], bd=0, show="•", width=50)
-        e.pack(pady=(16, 6), ipady=6)
+                     insertbackground=c["accent2"], bd=0, show="•", width=52)
+        e.pack(pady=(12, 6), ipady=6)
         if self.api_key:
             e.insert(0, self.api_key)
 
+        # ── 代理设置 ──
+        tk.Label(d, text="🔌 代理地址（可选，如 http://127.0.0.1:7890）",
+                 fg=c["accent2"], bg=c["bg_card"],
+                 font=("Segoe UI", 12, "bold")).pack(pady=(16, 4))
+        proxy_entry = tk.Entry(d, font=("Segoe UI", 11), bg=c["bg_input"], fg=c["fg"],
+                     insertbackground=c["accent2"], bd=0, width=52)
+        proxy_entry.pack(pady=(4, 2), ipady=6)
+        # 读取当前代理配置
+        lc = os.path.join(get_app_dir(), "herrs_config.json")
+        current_proxy = ""
+        try:
+            if os.path.exists(lc):
+                current_proxy = json.load(open(lc)).get("proxy", "")
+        except: pass
+        if current_proxy:
+            proxy_entry.insert(0, current_proxy)
+        tk.Label(d, text="留空则不使用代理", fg=c["fg_dim"],
+                 bg=c["bg_card"], font=("Segoe UI", 8)).pack()
+
         st = tk.Label(d, text="", fg=c["success"], bg=c["bg_card"],
                       font=("Segoe UI", 9))
-        st.pack()
+        st.pack(pady=(2, 0))
 
         def save():
             k = e.get().strip()
@@ -793,16 +948,25 @@ class HerrsApp:
             if not k.startswith("sk-"):
                 st.configure(text="格式不对（应以 sk- 开头）", fg=c["danger"]); return
             self.api_key = k
+            p = proxy_entry.get().strip()
             lc = os.path.join(get_app_dir(), "herrs_config.json")
+            cfg = {"api_key": k}
+            if p:
+                cfg["proxy"] = p
             try:
-                json.dump({"api_key": k}, open(lc, "w"))
+                json.dump(cfg, open(lc, "w"))
             except:
                 pass
-            self.key_btn.configure(text="🔑 已配置", fg=c["warn"])
+            # 更新全局代理
+            global _proxy
+            _proxy = {"http": p, "https": p} if p else None
+            self.key_btn.configure(text="🔑 已配置" if not p else f"🔑 已配置 · 代理",
+                                   fg=c["warn"])
             st.configure(text="✅ 保存成功！", fg=c["success"])
             total = sum(len(v) for v in self.skill_groups.values())
             self.status_lbl.configure(
-                text=f"  🟢 就绪  |  Skills: {total}  |  Ctrl+Enter 发送")
+                text=f"  🟢 就绪  |  Skills: {total}  |  Ctrl+Enter 发送",
+                fg=c["fg_dim"])
             d.after(800, d.destroy)
 
         btn_save = tk.Label(d, text="  保  存  ", fg="white", bg=c["accent"],

@@ -11,8 +11,8 @@
 | | Hermes | Herrs（就这） |
 |------|------|------|
 | 工具 | 80+ | 18 |
-| 安装 | 一堆脚本 | pip install 三行 |
-| 启动 | 开终端打 hermes | 双击 exe |
+| 安装 | 一堆脚本 | 双击 一键安装.bat |
+| 启动 | 开终端打 hermes | 双击 启动.bat |
 | 关系 | 航母 | 橡皮艇 |
 
 橡皮艇也能过河。
@@ -44,16 +44,18 @@
 
 **不是它聪明，是它真敢动手。**
 
-## 怎么用
+## 新电脑怎么装
 
-```bash
-pip install -r requirements.txt
-python main.py
+```
+1. 装 Python 3.10+（勾选 "Add Python to PATH"）
+2. 双击 一键安装.bat
+3. 启动后点右上角 🔑 设置 API Key
+4. （可选）填代理地址，比如 http://127.0.0.1:7890
 ```
 
-然后去搞个 Key，粘进去，完事。
+就这点事。完。
 
-## 打包
+## 打包成 EXE
 
 ```bash
 pyinstaller --onefile --noconsole --name "Herrs" main.py
@@ -63,6 +65,8 @@ exe 在 `dist/Herrs.exe`。
 
 ## 其他
 
+- 状态栏会显示模型在干嘛——📡调用API → 🧠思考中 → 🔧执行工具 → ✍️生成回复
+- 权限不足会自动提示你（比如需要管理员运行）
 - 80+ Skill 在左边（虽然只能当提示词）
 - 关窗口缩托盘，`Ctrl+Shift+H` 叫回来
 - Key 存本地，不上传
