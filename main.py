@@ -6,6 +6,7 @@ import threading, json, os, sys, subprocess, time as _time, collections, datetim
 # 抑制 SSL 警告（使用本地代理时）
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests
 
 # ── Debug ──
 DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herrs_debug.log")
@@ -36,10 +37,47 @@ def get_proxy_config():
         if val:
             debug(f"使用环境变量代理 ({env_var}): {val}")
             return {"http": val, "https": val}
-    debug("未检测到代理配置")
+    # ── 自动扫描本机代理端口（兜底）──
+    debug("未检测到代理配置，启动自动扫描...")
+    candidates = [
+        "http://127.0.0.1:7890",   # Clash default
+        "http://127.0.0.1:7891",   # Clash mixed
+        "http://127.0.0.1:10809",  # v2ray/clash mixed
+        "http://127.0.0.1:1080",   # SOCKS5
+        "http://127.0.0.1:8080",   # common HTTP
+        "http://127.0.0.1:8118",   # privoxy
+    ]
+    for proxy_url in candidates:
+        try:
+            r = requests.get("https://www.baidu.com",
+                           proxies={"http": proxy_url, "https": proxy_url},
+                           timeout=4, verify=False)
+            if r.status_code == 200:
+                debug(f"自动检测到代理: {proxy_url}")
+                return {"http": proxy_url, "https": proxy_url}
+        except Exception:
+            continue
+    debug("自动扫描未发现可用代理")
     return None
 
+# ── 代理扫描结果缓存（避免每次启动重复扫）──
+def _save_auto_proxy(proxies):
+    """把自动检测到的代理写入配置文件，下次直接读"""
+    lc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herrs_config.json")
+    try:
+        cfg = {}
+        if os.path.exists(lc):
+            cfg = json.load(open(lc))
+        if proxies and not cfg.get("proxy"):
+            cfg["proxy"] = proxies["http"]
+            json.dump(cfg, open(lc, "w"), indent=2)
+            debug(f"已将自动检测的代理写入配置: {proxies['http']}")
+    except Exception:
+        pass
+
 _proxy = get_proxy_config()
+if _proxy:
+    _save_auto_proxy(_proxy)
 
 HERMES_HOME = os.path.expandvars(r"%LOCALAPPDATA%\hermes")
 SKILLS_DIR = os.path.join(HERMES_HOME, "skills")
@@ -65,7 +103,7 @@ TOOLS = [
     {"type": "function", "function": {"name": "disk_info", "description": "磁盘空间", "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {"name": "get_env", "description": "系统环境信息", "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {"name": "process_list", "description": "进程列表", "parameters": {"type": "object", "properties": {"top": {"type": "integer", "description": "显示前N个"}}, "required": []}}},
-    {"type": "function", "function": {"name": "web_search", "description": "搜索网页（DuckDuckGo）", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "搜索关键词"}, "max_results": {"type": "integer", "description": "最多返回条数，默认5"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "web_search", "description": "搜索网页（Bing）", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "搜索关键词"}, "max_results": {"type": "integer", "description": "最多返回条数，默认5"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "web_fetch", "description": "获取网页内容", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "网页地址"}}, "required": ["url"]}}},
     {"type": "function", "function": {"name": "download_file", "description": "下载文件到本地", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "save_path": {"type": "string", "description": "保存路径，默认下载到桌面"}}, "required": ["url"]}}},
     {"type": "function", "function": {"name": "open_file", "description": "用默认程序打开文件/文件夹/网址", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
@@ -108,7 +146,9 @@ def execute_tool(name, args):
         elif name == "run_command":
             cmd, to = args.get("command",""), args.get("timeout",60)
             try:
-                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=to, cwd=os.path.expanduser("~"))
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                    encoding="gbk", errors="replace",
+                                    timeout=to, cwd=os.path.expanduser("~"))
                 return (r.stdout.strip() or r.stderr.strip() or "(无输出)")[:5000]
             except subprocess.TimeoutExpired:
                 return f"超时 ({to}s)"
@@ -126,7 +166,9 @@ def execute_tool(name, args):
         elif name == "process_list":
             top = args.get("top", 10)
             try:
-                r = subprocess.run("tasklist /fo csv /nh", shell=True, capture_output=True, text=True, timeout=10)
+                r = subprocess.run("tasklist /fo csv /nh", shell=True,
+                                    capture_output=True, text=True,
+                                    encoding="gbk", errors="replace", timeout=10)
                 lines = r.stdout.strip().split("\n")[:top*2]
                 return "\n".join(lines) if lines else "无法获取"
             except: return "获取进程失败"
@@ -144,19 +186,36 @@ def execute_tool(name, args):
             query = args.get("query", "")
             max_r = args.get("max_results", 5)
             try:
-                url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="replace")
-                import re
-                results = re.findall(r'class="result__snippet">(.*?)</a>', html, re.DOTALL)
-                titles = re.findall(r'class="result__title".*?<a[^>]*>(.*?)</a>', html, re.DOTALL)
-                links = re.findall(r'class="result__url".*?(https?://[^"<]+)', html)
-                out = []
-                for i in range(min(max_r, len(results))):
-                    t = re.sub(r'<[^>]+>', '', titles[i] if i < len(titles) else "").strip()
-                    s = re.sub(r'<[^>]+>', '', results[i]).strip()
-                    l = links[i] if i < len(links) else ""
-                    out.append(f"{i+1}. {t}\n   {s}\n   {l}")
+                import requests as _req, urllib3, re
+                urllib3.disable_warnings()
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                req_kw = {"headers": headers, "timeout": 15, "verify": False}
+                if _proxy:
+                    req_kw["proxies"] = _proxy
+                r = _req.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}",
+                           **req_kw)
+                html = r.text
+                # Bing搜索结果：匹配 cite (链接) + a标签（标题）
+                cites = re.findall(r'<cite>(.*?)</cite>', html, re.DOTALL)
+                links = re.findall(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL)
+                # 过滤掉bing自身链接，保留外部结果
+                results = [(re.sub(r'<[^>]+>', '', text).strip(), href)
+                          for href, text in links
+                          if 'bing.com' not in href and 'microsoft.com' not in href]
+                seen = set(); out = []
+                for title, url in results:
+                    if len(title) < 10 or url in seen:
+                        continue
+                    seen.add(url)
+                    # 匹配cite
+                    cite_text = ""
+                    for c in cites:
+                        clean = re.sub(r'<[^>]+>', '', c).strip()
+                        if clean and clean.split('/')[0].rstrip() in url:
+                            cite_text = clean; break
+                    out.append(f"{len(out)+1}. {title}\n   {cite_text or url}\n   {url}")
+                    if len(out) >= max_r:
+                        break
                 return "\n\n".join(out) if out else f"未找到 '{query}' 的结果"
             except Exception as e:
                 return f"搜索失败: {e}"
@@ -317,12 +376,21 @@ def call_deepseek_with_tools(messages, api_key, progress_cb=None):
             return f"🔌 代理连接失败 ({_proxy.get('http','?')}): 请检查代理是否在运行，或在配置中移除代理"
         except requests.exceptions.SSLError as e:
             debug(f"SSL错误: {e}")
-            # SSL失败时关闭验证重试一次
+            # 策略1: 先关SSL验证试试
             if req_kwargs.get("verify") is not False:
                 req_kwargs["verify"] = False
                 debug("关闭SSL验证重试...")
                 continue
-            return f"🔒 SSL证书验证失败: {e}"
+            # 策略2: verify=False 仍报错（如 EOF）→ 延迟重试，服务端临时问题
+            if loop < 2:
+                import time as _t
+                wait = (loop + 1) * 2
+                if progress_cb:
+                    progress_cb(f"🔒 SSL握手异常，{wait}秒后重试 ({loop+1}/2)...", phase="wait")
+                debug(f"SSL重试 {loop+1}/2，等待{wait}s...")
+                _t.sleep(wait)
+                continue
+            return f"🔒 SSL连接失败（已重试2次）: {str(e)[:120]}"
         except requests.exceptions.ConnectionError as e:
             debug(f"连接错误: {e}")
             if "getaddrinfo failed" in str(e) or "Name or service not known" in str(e):
@@ -846,6 +914,27 @@ class HerrsApp:
                         result = f"⏳ API限流 [{r.status_code}]，请稍后重试"
                     else:
                         result = f"🌐 API 错误 [{r.status_code}]: {r.text[:200]}"
+                except requests.exceptions.SSLError as e:
+                    # 尝试关SSL验证重试一次
+                    if req_kw.get("verify") is not False:
+                        req_kw["verify"] = False
+                        try:
+                            r = requests.post("https://api.deepseek.com/v1/chat/completions",
+                                headers={"Authorization": f"Bearer {self.api_key}",
+                                         "Content-Type": "application/json"},
+                                json={"model": "deepseek-chat",
+                                      "messages": [{"role": "system",
+                                                    "content": "你是 Herrs，AI桌面助手。纯聊天模式，不用工具。简洁回答，中文。"}]
+                                                  + self.messages[-6:],
+                                      "max_tokens": 4096}, **req_kw)
+                            if r.status_code == 200:
+                                result = r.json()["choices"][0]["message"]["content"]
+                            else:
+                                result = f"🌐 API 错误 [{r.status_code}]"
+                        except Exception as e2:
+                            result = f"🔒 SSL连接失败: {str(e2)[:100]}"
+                    else:
+                        result = f"🔒 SSL连接失败: {str(e)[:100]}"
                 except requests.exceptions.ConnectionError as e:
                     result = f"🔌 网络连接失败: 检查网络或代理设置\n  ({str(e)[:120]})"
                 except requests.exceptions.ProxyError:
