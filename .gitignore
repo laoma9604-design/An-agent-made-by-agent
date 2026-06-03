@@ -1,0 +1,10 @@
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+herrs_debug.log
+herrs_config.json
+hermes_config.json
+*.exe
+my_skills/
